@@ -1,0 +1,635 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Grumpkin</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      background: #000000;
+      overflow: hidden;
+      height: 100vh;
+      font-family: 'Segoe UI', system-ui, sans-serif;
+    }
+
+    /* Layout container */
+    .layout {
+      position: relative;
+      width: 100vw;
+      height: 100vh;
+    }
+
+    /* Left side: image display — sits on top */
+    .image-panel {
+      position: absolute;
+      left: 0;
+      top: 0;
+      width: 50%;
+      height: 100%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 24px;
+      z-index: 5;
+      /* No background — body is already black, and this lets
+         canvas particles show through behind the image */
+    }
+    .image-panel img {
+      max-width: 100%;
+      max-height: 100%;
+      object-fit: contain;
+      border-radius: 12px;
+      transition: opacity 0.35s ease;
+    }
+    .image-panel img.fading {
+      opacity: 0;
+    }
+
+    /* Right side: canvas for grumpkin cloud — 60% wide, overlaps behind image */
+    .cloud-panel {
+      position: absolute;
+      right: 0;
+      top: 0;
+      width: 60%;
+      height: 100%;
+      background: #000000;
+    }
+    canvas {
+      display: block;
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+    }
+
+    /* Mobile: image on bottom, cloud on top */
+    @media (max-width: 768px) {
+      .image-panel {
+        left: 0;
+        top: auto;
+        bottom: 0;
+        width: 100%;
+        height: 50%;
+        padding: 16px;
+      }
+      .cloud-panel {
+        right: auto;
+        left: 0;
+        top: 0;
+        width: 100%;
+        height: 60%;
+      }
+    }
+  </style>
+  <script src="https://cdn.jsdelivr.net/npm/tone@14.7.77/build/Tone.js"></script>
+</head>
+<body>
+  <div class="layout">
+    <div class="image-panel" id="imagePanel">
+      <img id="currentImage" src="" alt="" style="opacity:0;">
+    </div>
+    <div class="cloud-panel" id="cloudPanel">
+      <canvas id="canvas"></canvas>
+    </div>
+  </div>
+
+  <script type="module">
+    // ============================================================
+    // Firebase setup — disabled (uncomment to re-enable uploads)
+    // ============================================================
+    // import { initializeApp } from "https://www.gstatic.com/firebasejs/12.11.0/firebase-app.js";
+    // import { getStorage, ref, uploadBytesResumable } from "https://www.gstatic.com/firebasejs/12.11.0/firebase-storage.js";
+    // const firebaseConfig = { /* add config here */ };
+    // const firebaseApp = initializeApp(firebaseConfig);
+    // const storage = getStorage(firebaseApp);
+
+    // ============================================================
+    // Upload animation state
+    // ============================================================
+    let uploadAnimSpeed = 1;   // multiplier for orbital speed (ramps to 2)
+    let uploadOrbitScale = 1;  // multiplier for orbit radius (expands during upload)
+    let collapseAmount = 1;    // 1 = normal, 0 = collapsed to center
+
+    // Smooth targets (we lerp toward these)
+    let targetSpeed = 1;
+    let targetOrbitScale = 1;
+    let targetCollapse = 1;
+
+    const canvas = document.getElementById('canvas');
+    const ctx = canvas.getContext('2d');
+    const cloudPanel = document.getElementById('cloudPanel');
+    const currentImage = document.getElementById('currentImage');
+
+    let IMAGE_COUNT = 0;
+    let currentIndex = 0; // 0-based internally, maps to 1-based filenames
+
+    // Probe for available image/audio pairs: try 1.jpeg, 2.jpeg, ... until one fails
+    // Also preloads all images into browser cache as a side effect
+    (function detectMediaCount() {
+      function tryNext(n) {
+        const img = new Image();
+        img.onload = () => {
+          IMAGE_COUNT = n;
+          tryNext(n + 1);
+        };
+        img.onerror = () => {
+          console.log(`[Grumpkin] Detected ${IMAGE_COUNT} media pairs`);
+        };
+        img.src = `${n}.jpeg`;
+      }
+      tryNext(1);
+    })();
+
+    function showImage(index) {
+      const src = `${index + 1}.jpeg`;
+      // Clear the initial hidden state (inline opacity:0)
+      currentImage.style.opacity = '';
+      currentImage.classList.add('fading');
+
+      setTimeout(() => {
+        currentImage.onload = () => {
+          currentImage.classList.remove('fading');
+          currentImage.onload = null;
+          currentImage.onerror = null;
+        };
+        currentImage.onerror = () => {
+          currentImage.classList.remove('fading');
+          currentImage.onerror = null;
+        };
+
+        currentImage.src = src;
+        currentImage.alt = `Grumpkin ${index + 1}`;
+
+        if (currentImage.complete && currentImage.naturalWidth > 0) {
+          currentImage.classList.remove('fading');
+          currentImage.onload = null;
+          currentImage.onerror = null;
+        }
+      }, 200);
+    }
+
+    // First keypress shows image 1 + plays audio; after that, normal cycling
+    let started = false;
+
+    document.addEventListener('keydown', (e) => {
+      if (IMAGE_COUNT === 0) return; // media not yet detected
+      if (!started) {
+        // First interaction — show image 1 and play its audio
+        started = true;
+        currentIndex = 0;
+        showImage(currentIndex);
+        playCurrentAudio();
+        return;
+      }
+
+      if (e.key === 'ArrowLeft') {
+        currentIndex = (currentIndex - 1 + IMAGE_COUNT) % IMAGE_COUNT;
+      } else {
+        currentIndex = (currentIndex + 1) % IMAGE_COUNT;
+      }
+      showImage(currentIndex);
+      playCurrentAudio();
+    });
+
+    // Touch support: tap = next, swipe left = next, swipe right = back
+    let touchStartX = null;
+    let touchStartY = null;
+    const SWIPE_THRESHOLD = 50;
+
+    document.addEventListener('touchstart', (e) => {
+      touchStartX = e.touches[0].clientX;
+      touchStartY = e.touches[0].clientY;
+    }, { passive: true });
+
+    document.addEventListener('touchend', (e) => {
+      const touchEndX = e.changedTouches[0].clientX;
+      const touchEndY = e.changedTouches[0].clientY;
+      const dx = touchEndX - touchStartX;
+      const dy = touchEndY - touchStartY;
+
+      // Determine if it was a swipe (horizontal movement > threshold and > vertical)
+      const isSwipe = Math.abs(dx) > SWIPE_THRESHOLD && Math.abs(dx) > Math.abs(dy);
+
+      if (IMAGE_COUNT === 0) return; // media not yet detected
+      if (!started) {
+        started = true;
+        currentIndex = 0;
+        showImage(currentIndex);
+        playCurrentAudio();
+        touchStartX = null;
+        return;
+      }
+
+      if (isSwipe && dx > 0) {
+        // Swipe right = go back
+        currentIndex = (currentIndex - 1 + IMAGE_COUNT) % IMAGE_COUNT;
+      } else {
+        // Tap or swipe left = next
+        currentIndex = (currentIndex + 1) % IMAGE_COUNT;
+      }
+      showImage(currentIndex);
+      playCurrentAudio();
+      touchStartX = null;
+    });
+
+    // Canvas sizing — fill the cloud panel
+    let panelWidth, panelHeight;
+    function resize() {
+      const rect = cloudPanel.getBoundingClientRect();
+      panelWidth = canvas.width = rect.width;
+      panelHeight = canvas.height = rect.height;
+    }
+    resize();
+    window.addEventListener('resize', resize);
+
+    // Audio config — loaded from audio-config.json
+    // "pitch": total desired pitch shift in semitones (12 = one octave up)
+    // "speed": playback rate multiplier (2 = double speed)
+    let audioConfig = { pitch: -5, speed: 1 };
+
+    // Load config (async, falls back to defaults above)
+    fetch('audio-config.json')
+      .then(r => r.json())
+      .then(c => { audioConfig = c; })
+      .catch(() => {});
+
+    // Audio state — single persistent context, swap sources per track
+    let audioCtx, analyser, pitchShiftNode, currentSource, audio;
+    let frequencyData, timeDomainData;
+    let isPlaying = false;
+    let audioContextReady = false;
+
+    function ensureAudioContext() {
+      if (audioContextReady) return;
+
+      console.log('[Grumpkin Audio] Tone.js loaded?', typeof Tone !== 'undefined');
+      console.log('[Grumpkin Audio] audioConfig:', JSON.stringify(audioConfig));
+
+      audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+
+      // Tell Tone.js to use our AudioContext so all nodes share one context
+      Tone.setContext(audioCtx);
+      console.log('[Grumpkin Audio] Tone context set, state:', audioCtx.state);
+
+      analyser = audioCtx.createAnalyser();
+      analyser.fftSize = 512;
+      analyser.smoothingTimeConstant = 0.8;
+      frequencyData = new Uint8Array(analyser.frequencyBinCount);
+      timeDomainData = new Uint8Array(analyser.frequencyBinCount);
+
+      // playbackRate naturally shifts pitch by 12*log2(speed) semitones.
+      // Calculate how much additional pitch shift Tone.js needs to apply.
+      const speedPitchEffect = 12 * Math.log2(audioConfig.speed || 1);
+      const additionalPitch = (audioConfig.pitch || 0) - speedPitchEffect;
+      console.log('[Grumpkin Audio] speedPitchEffect:', speedPitchEffect, 'additionalPitch:', additionalPitch);
+
+      pitchShiftNode = new Tone.PitchShift(additionalPitch);
+      console.log('[Grumpkin Audio] PitchShift created, pitch:', pitchShiftNode.pitch);
+      pitchShiftNode.output.connect(analyser);
+      console.log('[Grumpkin Audio] PitchShift output → analyser connected');
+
+      // Wire: analyser -> speakers (permanent connection)
+      analyser.connect(audioCtx.destination);
+      console.log('[Grumpkin Audio] analyser → destination connected');
+
+      audioContextReady = true;
+    }
+
+    let audioGeneration = 0; // increments each time we start a new track
+
+    function playCurrentAudio() {
+      ensureAudioContext();
+
+      // Stop previous track
+      if (audio) {
+        audio.pause();
+        audio.src = '';
+        console.log('[Grumpkin Audio] Stopped previous audio');
+      }
+      if (currentSource) {
+        try { currentSource.disconnect(); } catch(e) {}
+      }
+
+      const gen = ++audioGeneration;
+      const audioFile = `${currentIndex + 1}.m4a`;
+      console.log('[Grumpkin Audio] Loading:', audioFile, 'gen:', gen);
+
+      audio = new Audio(audioFile);
+      audio.playbackRate = audioConfig.speed || 1;
+      const thisAudio = audio; // capture reference for callback
+
+      thisAudio.addEventListener('canplaythrough', () => {
+        // If a newer track was requested, abandon this one
+        if (gen !== audioGeneration) {
+          console.log('[Grumpkin Audio] Skipping stale callback, gen:', gen, 'current:', audioGeneration);
+          thisAudio.pause();
+          thisAudio.src = '';
+          return;
+        }
+
+        currentSource = audioCtx.createMediaElementSource(thisAudio);
+        console.log('[Grumpkin Audio] MediaElementSource created for', audioFile);
+
+        // Connect source through pitch shift chain
+        // Use Tone.connect() to bridge raw Web Audio node → Tone.js node
+        Tone.connect(currentSource, pitchShiftNode);
+        console.log('[Grumpkin Audio] Connected source → PitchShift');
+
+        if (audioCtx.state === 'suspended') audioCtx.resume();
+        thisAudio.play();
+        isPlaying = true;
+        console.log('[Grumpkin Audio] Playing:', audioFile, 'playbackRate:', thisAudio.playbackRate);
+      }, { once: true });
+
+      thisAudio.addEventListener('ended', () => {
+        if (gen === audioGeneration) isPlaying = false;
+      });
+    }
+
+    function playThankYou() {
+      ensureAudioContext();
+
+      if (audio) { audio.pause(); audio.src = ''; }
+      if (currentSource) { try { currentSource.disconnect(); } catch(e) {} }
+
+      const gen = ++audioGeneration;
+      audio = new Audio('thankyou.m4a');
+      audio.playbackRate = audioConfig.speed || 1;
+      const thisAudio = audio;
+
+      thisAudio.addEventListener('canplaythrough', () => {
+        if (gen !== audioGeneration) { thisAudio.pause(); thisAudio.src = ''; return; }
+        currentSource = audioCtx.createMediaElementSource(thisAudio);
+        Tone.connect(currentSource, pitchShiftNode);
+        if (audioCtx.state === 'suspended') audioCtx.resume();
+        thisAudio.play();
+        isPlaying = true;
+        console.log('[Grumpkin Audio] Playing: thankyou.m4a');
+      }, { once: true });
+
+      thisAudio.addEventListener('ended', () => {
+        if (gen === audioGeneration) isPlaying = false;
+      });
+    }
+
+    // Particle system — bigger cloud with far-orbiting specks
+    const PARTICLE_COUNT = 350;
+    const particles = [];
+
+    class Particle {
+      constructor() {
+        this.reset();
+      }
+
+      reset() {
+        this.angle = Math.random() * Math.PI * 2;
+        // Scale radii relative to panel so cloud fills it nicely
+        const scale = Math.min(panelWidth, panelHeight) / 600;
+        // Most particles in a dense core; ~15% are far-orbiting specks
+        if (Math.random() < 0.15) {
+          this.baseRadius = (160 + Math.random() * 140) * scale; // far orbiting
+          this.isFarSpeck = true;
+        } else {
+          this.baseRadius = (30 + Math.random() * 130) * scale;  // core cloud
+          this.isFarSpeck = false;
+        }
+        this.radius = this.baseRadius;
+        this.x = 0;
+        this.y = 0;
+        this.size = this.isFarSpeck ? (0.5 + Math.random() * 1.5) : (1 + Math.random() * 3);
+        this.baseSize = this.size;
+        this.speed = 0.002 + Math.random() * 0.008;
+        this.offset = Math.random() * Math.PI * 2;
+        this.hueType = Math.floor(Math.random() * 3); // 0=cyan, 1=magenta, 2=blue
+        this.alpha = 0.3 + Math.random() * 0.5;
+        this.drift = (Math.random() - 0.5) * 0.5;
+      }
+
+      update(volume, bass, mid, treble, time, cx, cy) {
+        // Apply upload speed multiplier
+        this.angle += (this.speed + volume * 0.02) * uploadAnimSpeed;
+
+        const volumeBoost = volume * (this.isFarSpeck ? 250 : 200);
+        const bassBoost = bass * (this.isFarSpeck ? 100 : 70);
+        const rawRadius = this.baseRadius + volumeBoost + bassBoost +
+          Math.sin(time * 0.001 + this.offset) * 25;
+
+        // Apply orbit scale (expands during upload) and collapse
+        this.radius = rawRadius * uploadOrbitScale * collapseAmount;
+
+        const wobble = Math.sin(time * 0.002 + this.offset) * volume * 35;
+        this.x = cx + Math.cos(this.angle) * this.radius + wobble * collapseAmount;
+        this.y = cy + Math.sin(this.angle) * this.radius +
+          Math.cos(time * 0.001 + this.offset) * this.drift * 50 * collapseAmount;
+
+        this.size = this.baseSize + volume * (this.isFarSpeck ? 4 : 8) + bass * 4;
+        this.alpha = (this.isFarSpeck ? 0.1 : 0.15) + volume * (this.isFarSpeck ? 0.5 : 0.7);
+      }
+
+      draw(volume, bass, mid, treble) {
+        let hue, saturation, lightness;
+
+        if (this.hueType === 0) {
+          hue = 180 + treble * 30;
+          saturation = 80 + treble * 20;
+          lightness = 50 + treble * 30;
+        } else if (this.hueType === 1) {
+          hue = 300 + mid * 20;
+          saturation = 70 + mid * 30;
+          lightness = 45 + mid * 35;
+        } else {
+          hue = 220 + bass * 40;
+          saturation = 75 + bass * 25;
+          lightness = 40 + bass * 40;
+        }
+
+        ctx.beginPath();
+        ctx.arc(this.x, this.y, Math.max(0.5, this.size), 0, Math.PI * 2);
+        ctx.fillStyle = `hsla(${hue}, ${saturation}%, ${lightness}%, ${this.alpha})`;
+        ctx.fill();
+
+        if (volume > 0.4 && !this.isFarSpeck) {
+          ctx.beginPath();
+          ctx.arc(this.x, this.y, this.size * 3, 0, Math.PI * 2);
+          ctx.fillStyle = `hsla(${hue}, ${saturation}%, ${lightness}%, ${(volume - 0.4) * 0.15})`;
+          ctx.fill();
+        }
+      }
+    }
+
+    for (let i = 0; i < PARTICLE_COUNT; i++) {
+      particles.push(new Particle());
+    }
+
+    // Audio energy helpers
+    function getEnergy(startBin, endBin) {
+      if (!frequencyData) return 0;
+      let sum = 0;
+      for (let i = startBin; i < endBin && i < frequencyData.length; i++) {
+        sum += frequencyData[i];
+      }
+      return sum / ((endBin - startBin) * 255);
+    }
+
+    function getVolume() {
+      if (!timeDomainData) return 0;
+      let sum = 0;
+      for (let i = 0; i < timeDomainData.length; i++) {
+        const v = (timeDomainData[i] - 128) / 128;
+        sum += v * v;
+      }
+      return Math.sqrt(sum / timeDomainData.length);
+    }
+
+    // Smoothed values
+    let smoothVolume = 0;
+    let smoothBass = 0;
+    let smoothMid = 0;
+    let smoothTreble = 0;
+
+    function animate(time) {
+      requestAnimationFrame(animate);
+
+      // Lerp upload animation state toward targets
+      const lerpRate = 0.05;
+      uploadAnimSpeed += (targetSpeed - uploadAnimSpeed) * lerpRate;
+      uploadOrbitScale += (targetOrbitScale - uploadOrbitScale) * lerpRate;
+      collapseAmount += (targetCollapse - collapseAmount) * 0.08;
+
+      if (analyser && isPlaying) {
+        analyser.getByteFrequencyData(frequencyData);
+        analyser.getByteTimeDomainData(timeDomainData);
+      }
+
+      const rawVolume = isPlaying ? getVolume() : 0;
+      const rawBass = isPlaying ? getEnergy(1, 8) : 0;
+      const rawMid = isPlaying ? getEnergy(8, 40) : 0;
+      const rawTreble = isPlaying ? getEnergy(40, 128) : 0;
+
+      const smoothing = 0.15;
+      smoothVolume += (rawVolume - smoothVolume) * smoothing;
+      smoothBass += (rawBass - smoothBass) * smoothing;
+      smoothMid += (rawMid - smoothMid) * smoothing;
+      smoothTreble += (rawTreble - smoothTreble) * smoothing;
+
+      // Clear with exact background color for clean fade
+      ctx.fillStyle = 'rgba(0, 0, 0, 0.18)';
+      ctx.fillRect(0, 0, panelWidth, panelHeight);
+
+      // Cloud center: shifted into the visible (non-overlapped) area.
+      // Desktop: right half of viewport → about 58% across the canvas.
+      // Mobile: top half of viewport → about 42% down the canvas.
+      const isMobile = window.innerWidth <= 768;
+      const cx = isMobile ? panelWidth / 2 : panelWidth * 0.58;
+      const cy = isMobile ? panelHeight * 0.42 : panelHeight / 2;
+
+      // Connection lines
+      if (smoothVolume > 0.05) {
+        for (let i = 0; i < particles.length; i += 3) {
+          for (let j = i + 1; j < particles.length; j += 5) {
+            const dx = particles[i].x - particles[j].x;
+            const dy = particles[i].y - particles[j].y;
+            const dist = Math.sqrt(dx * dx + dy * dy);
+            const maxDist = 60 + smoothVolume * 80;
+
+            if (dist < maxDist) {
+              const alpha = (1 - dist / maxDist) * smoothVolume * 0.3;
+              ctx.beginPath();
+              ctx.moveTo(particles[i].x, particles[i].y);
+              ctx.lineTo(particles[j].x, particles[j].y);
+              ctx.strokeStyle = `hsla(200, 80%, 60%, ${alpha})`;
+              ctx.lineWidth = 0.5;
+              ctx.stroke();
+            }
+          }
+        }
+      }
+
+      // Update and draw particles
+      for (const p of particles) {
+        p.update(smoothVolume, smoothBass, smoothMid, smoothTreble, time, cx, cy);
+        p.draw(smoothVolume, smoothBass, smoothMid, smoothTreble);
+      }
+
+      // Central glow — fades to exact background color #0a0a0f (rgb 10,10,15)
+      const glowRadius = 80 + smoothVolume * 200 + smoothBass * 100;
+      const gradient = ctx.createRadialGradient(cx, cy, 0, cx, cy, glowRadius);
+      gradient.addColorStop(0, `hsla(280, 80%, 60%, ${0.05 + smoothVolume * 0.15})`);
+      gradient.addColorStop(0.5, `hsla(200, 80%, 50%, ${0.02 + smoothVolume * 0.08})`);
+      gradient.addColorStop(1, 'rgba(0, 0, 0, 0)');
+      ctx.beginPath();
+      ctx.arc(cx, cy, glowRadius, 0, Math.PI * 2);
+      ctx.fillStyle = gradient;
+      ctx.fill();
+    }
+
+    animate(0);
+
+    // No image shown on load — first keypress triggers it
+
+    // ============================================================
+    // Drag and drop → upload to Firebase Storage
+    // ============================================================
+    let isUploading = false;
+    const MIN_UPLOAD_ANIM_MS = 2000; // minimum time for the swirl animation
+
+    // Prevent default drag behaviors (so browser doesn't open the file)
+    ['dragenter', 'dragover', 'dragleave', 'drop'].forEach(evt => {
+      document.addEventListener(evt, (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+      });
+    });
+
+    document.addEventListener('drop', (e) => {
+      if (isUploading) return;
+
+      const file = e.dataTransfer.files[0];
+      if (!file) return;
+
+      if (file.type.startsWith('image/')) {
+        uploadImage(file);
+      } else {
+        triggerCollapse();
+      }
+    });
+
+    // Upload disabled — uncomment Firebase setup above to re-enable
+    function uploadImage(file) {
+      // isUploading = true;
+      // targetSpeed = 2;
+      // targetOrbitScale = 1.8;
+      // const animStartTime = Date.now();
+      // const timestamp = Date.now();
+      // const filePath = `uploads/${timestamp}_${file.name}`;
+      // const storageRef = ref(storage, filePath);
+      // const uploadTask = uploadBytesResumable(storageRef, file);
+      // function finishUpload() {
+      //   const elapsed = Date.now() - animStartTime;
+      //   const remaining = Math.max(0, MIN_UPLOAD_ANIM_MS - elapsed);
+      //   setTimeout(() => {
+      //     isUploading = false;
+      //     targetSpeed = 1;
+      //     targetOrbitScale = 1;
+      //     playThankYou();
+      //   }, remaining);
+      // }
+      // uploadTask.on('state_changed',
+      //   (snapshot) => { targetOrbitScale = 1 + (snapshot.bytesTransferred / snapshot.totalBytes) * 0.8; },
+      //   (error) => { console.error('Upload failed:', error); isUploading = false; targetSpeed = 1; targetOrbitScale = 1; triggerCollapse(); },
+      //   () => { finishUpload(); }
+      // );
+    }
+
+    // Collapse animation for invalid files
+    function triggerCollapse() {
+      targetCollapse = 0;
+      setTimeout(() => {
+        targetCollapse = 1;
+      }, 600);
+    }
+  </script>
+</body>
+</html>
